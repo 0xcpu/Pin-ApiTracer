@@ -15,11 +15,8 @@
  * Pin version 3.6 by 0xcpu
  */
 
-#include "pin.H"
-#include <iostream>
-#include <fstream>
-#include <set>
-#include <map>
+#include "pin.h"
+#include "Utils.h"
 
 #define TOOL_NAME    "ApiTracer"
 #define AT_PAGE_SIZE 0x1000
@@ -34,105 +31,32 @@
 // Global variables 
 /* ================================================================== */
 
-std::string m_AnalysedApp;
-std::string m_Param;
-std::string m_StringsFileName;
+string g_AnalysedApp;
+string g_Param;
+string g_StringsFileName;
 
-FILE *m_TraceFile   = NULL; // trace log
-FILE *m_StringsFile = NULL; // collect dumped strings
+FILE *g_TraceFile   = NULL; // trace log
+FILE *g_StringsFile = NULL; // collect dumped strings
 
-INT m_myPid = 0;	    // PID of application
+INT g_MyPid;         	    // PID of application
 
-struct s_module {
-    std::string name;
-    ADDRINT start;
-    ADDRINT end;
-};
+pApiArgsArray g_ArgsArrayPtr;
+char *g_Args;
 
-std::map<ADDRINT, s_module> m_Modules;
-std::map<ADDRINT, s_module> m_Sections;
-
-
-const s_module *getModuleByAddr(ADDRINT Address, std::map<ADDRINT, s_module> &modules)
-{
-    std::map<ADDRINT, s_module>::iterator bound =  modules.upper_bound(Address);
-    std::map<ADDRINT, s_module>::iterator itr = modules.begin();
-    
-    for ( ; itr != bound ; itr++) {
-	s_module &mod = itr->second;
-	if (Address >= mod.start && Address < mod.end) {
-	    return &mod;
-	}
-    }
-    return NULL;
-}
-
-const bool isPageChanged(ADDRINT Address)  // without imagebase
-{
-    static ADDRINT prevPageAddr = UNKNOWN_ADDR;
-    
-    ADDRINT currPageAddr = (Address / AT_PAGE_SIZE);
-    if (prevPageAddr == UNKNOWN_ADDR || prevPageAddr != currPageAddr) { // execution in different memory page!
-	prevPageAddr = currPageAddr;
-	return true;
-    }
-    return false;
-}
-
-const bool isSectionChanged(ADDRINT Address)  // without imagebase
-{
-    static s_module* prevModule = NULL;
-    const s_module* currModule = getModuleByAddr(Address, m_Sections);
-	
-    if (prevModule != currModule) {
-	prevModule = (s_module*) currModule;
-	return true;
-    }
-    return false;
-}
-
-bool isMyModule(const s_module* mod, std::string name) 
-{
-    if (!mod) return false;
-    std::size_t found = mod->name.find(name);
-    if (found != std::string::npos) {
-	return true;
-    }
-    return false;
-}
-
-std::string getFilename(const std::string& str)
-{
-    std::size_t found = str.find_last_of("/\\");
-    std::size_t ext = str.find_last_of(".");
-    return str.substr(found + 1, ext - (found + 1));
-}
-
+std::map<ADDRINT, s_Module> g_Modules;
+std::map<ADDRINT, s_Module> g_Sections;
 
 /* ===================================================================== */
 // Command line switches
 /* ===================================================================== */
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE,  "pintool",
-			    "o", "", "specify file name for the output");
+                            "o", "", "specify file name for the output");
 
 KNOB<string> KnobModuleName(KNOB_MODE_WRITEONCE,  "pintool",
-			    "m", "", "Analysed module name (by default same as app name)");
+                            "m", "", "Analysed module name (by default same as app name)");
 
-/* ===================================================================== */
-// Utilities
-/* ===================================================================== */
-
-/*!
- *  Print out help message.
- */
-INT32 Usage()
-{
-    cerr << "This tool prints out : " << endl <<
-	"Addresses of redirections into to a new section." << endl << endl;
-
-    cerr << KNOB_BASE::StringKnobSummary() << endl;
-    return -1;
-}
+KNOB<string> KnobInputArgsFile(KNOB_MODE_WRITEONCE,  "pintool",
+                               "f", "", "specify file name for API format args");
 
 /* ===================================================================== */
 // Analysis routines
@@ -143,62 +67,60 @@ INT32 Usage()
  * @param[in]   numInstInBbl    number of instructions in the basic block
  * @note use atomic operations for multi-threaded applications
  */
-VOID SaveTranitions(ADDRINT Address, UINT32 numInstInBbl)
+VOID SaveTranitions(ADDRINT Address, UINT32 NumInstInBbl)
 {
     PIN_LockClient();
-    static s_module *prev_mod = NULL;
-    static bool     is_prevMy = false;
-    static ADDRINT  prevAddr  = UNKNOWN_ADDR;
 
-    const s_module *mod_ptr = getModuleByAddr(Address, m_Modules);
-    bool is_currMy = isMyModule(mod_ptr, m_AnalysedApp);
+    static ADDRINT  PrevAddr = UNKNOWN_ADDR;
 
-    if (is_currMy == false && is_prevMy == true && prevAddr != UNKNOWN_ADDR) {
-	if (mod_ptr) {
+    static s_Module *PrevMod = NULL;
+    const  s_Module *ModPtr  = GetModuleByAddr(Address, &g_Modules);
+
+    static bool IsPrevMy = false;
+    bool IsCurrMy = IsMyModule(ModPtr, g_AnalysedApp);
+
+    if (IsCurrMy == false && IsPrevMy == true && PrevAddr != UNKNOWN_ADDR) {
+	if (ModPtr) {
 #if _WIN64
-	    fprintf(m_TraceFile, "%#" HEX_PADD "llx,%s.", prevAddr, getFilename(mod_ptr->name).c_str());
+	    fprintf(g_TraceFile, "%#" HEX_PADD "llx,%s.", PrevAddr, GetFileName(ModPtr->Name).c_str());
 #else
-	    fprintf(m_TraceFile, "%#" HEX_PADD "x,%s.", prevAddr, getFilename(mod_ptr->name).c_str());
+            fprintf(g_TraceFile, "%#" HEX_PADD "x,%s.", PrevAddr, GetFileName(ModPtr->Name).c_str());
 #endif
-	    //PIN_LockClient();
-	    IMG pImg = IMG_FindByAddress(Address);
-	    RTN rtn  = RTN_FindByAddress(Address);
-	    //PIN_UnlockClient();
-		
-	    if (IMG_Valid(pImg) && RTN_Valid(rtn)) {
-		const string func = RTN_Name(rtn);
-		fprintf(m_TraceFile, "%s", func.c_str());
+	    IMG Img = IMG_FindByAddress(Address);
+	    RTN Rtn = RTN_FindByAddress(Address);
+	    if (IMG_Valid(Img) && RTN_Valid(Rtn)) {
+		const string Func = RTN_Name(Rtn);
+		fprintf(g_TraceFile, "%s", Func.c_str());
 	    }
-	    fprintf(m_TraceFile, "\n");
-		
+	    fprintf(g_TraceFile, "\n");
 	} else {
 #if _WIN64
-	    fprintf(m_TraceFile, "%#" HEX_PADD "llx,unknown module [%#" HEX_PADD "llx]\n", prevAddr, Address);
+            fprintf(g_TraceFile, "%#" HEX_PADD "llx,unknown module [%#" HEX_PADD "llx]\n", PrevAddr, Address);
 #else
-	    fprintf(m_TraceFile, "%#" HEX_PADD "x,unknown module [%#" HEX_PADD "x]\n", prevAddr, Address);
+	    fprintf(g_TraceFile, "%#" HEX_PADD "x,unknown module [%#" HEX_PADD "x]\n", PrevAddr, Address);
 #endif
 	}
-	fflush(m_TraceFile);
+	fflush(g_TraceFile);
     }
 
-    if (is_currMy) {
-	ADDRINT addr = Address - mod_ptr->start; // substract module's ImageBase
-	const s_module* sec = getModuleByAddr(addr, m_Sections);
-	if (isSectionChanged(addr)) {
-	    std::string name = (sec != NULL) ? sec->name : "?";
+    if (IsCurrMy) {
+	ADDRINT ImgBase = Address - ModPtr->Start; // substract module's ImageBase
+	const s_Module* Section = GetModuleByAddr(ImgBase, &g_Sections);
+	if (IsSectionChanged(ImgBase, &g_Sections)) {
+	    std::string Name = (Section != NULL) ? Section->Name : "?";
 #if _WIN64
-	    fprintf(m_TraceFile, "%#" HEX_PADD "llx,[section]: %s\n", addr, name.c_str());
+            fprintf(g_TraceFile, "%#" HEX_PADD "llx,[section]: %s\n", ImgBase, Name.c_str());
 #else
-	    fprintf(m_TraceFile, "%#" HEX_PADD "x,[section]: %s\n", addr, name.c_str());
+	    fprintf(g_TraceFile, "%#" HEX_PADD "x,[section]: %s\n", ImgBase, Name.c_str());
 #endif
-	    fflush(m_TraceFile);
+	    fflush(g_TraceFile);
 	}
-	prevAddr = addr; /* update saved */
+	PrevAddr = ImgBase; /* update saved */
     }
-	
+
     /* update saved */
-    is_prevMy = is_currMy;
-    prev_mod  = (s_module*) mod_ptr;
+    IsPrevMy = IsCurrMy;
+    PrevMod  = (s_Module*)ModPtr;
 
     PIN_UnlockClient();
 }
@@ -215,10 +137,10 @@ VOID SaveTranitions(ADDRINT Address, UINT32 numInstInBbl)
  * @param[in]   v        value specified by the tool in the TRACE_AddInstrumentFunction
  *                       function call
  */
-VOID Trace(TRACE trace, VOID *v)
+VOID InstrumentTrace(TRACE Trace, VOID *V)
 {
     // Visit every basic block in the trace
-    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
+    for (BBL bbl = TRACE_BblHead(Trace); BBL_Valid(bbl); bbl = BBL_Next(bbl))
 	{
 	    // Insert a call to SaveTranitions() before every basic block
 	    for (INS ins = BBL_InsHead(bbl); INS_Valid(ins); ins = INS_Next(ins)) {
@@ -231,187 +153,303 @@ VOID Trace(TRACE trace, VOID *v)
 	}
 }
 
-VOID LogFunction1WChar(CHAR *name, wchar_t *str)
+VOID LogFunction1WChar(const char * const cName, const wchar_t * const wStr)
 {
-    if (str == NULL) return;
-    fprintf(m_StringsFile, "[%s] %ls\n", name, str);
-    fflush(m_StringsFile);
+    if (wStr == NULL)
+        return;
+    fprintf(g_StringsFile, "[%s] %ls\n", cName, wStr);
+    fflush(g_StringsFile);
 }
 
-VOID LogFunction1Char(CHAR *name, CHAR *str)
+VOID LogFunction1Char(const char * const cName, const char * const cStr)
 {
-    if (str == NULL) return;
-    fprintf(m_StringsFile, "[%s] %s\n", name, str);
-    fflush(m_StringsFile);
+    if (cStr == NULL)
+        return;
+    fprintf(g_StringsFile, "[%s] %s\n", cName, cStr);
+    fflush(g_StringsFile);
 }
 
-VOID LogFunction2WChar(CHAR *funcname, wchar_t *filename, wchar_t *args)
+VOID LogFunction2WChar(const char    * const cFuncName,
+                       const wchar_t * const wFileName,
+                       const wchar_t * const wArgs)
 {
-    if (filename == NULL) return;
-    fprintf(m_StringsFile, "[%s] : %ls : %ls\n", funcname, filename, args);
-    fflush(m_StringsFile);
+    if (wFileName == NULL)
+        return;
+    fprintf(g_StringsFile, "[%s] : %ls : %ls\n", cFuncName, wFileName, wArgs);
+    fflush(g_StringsFile);
 }
 
-VOID LogSentData(CHAR *funcname, wchar_t *headers, int headers_length, unsigned char *content, int content_len)
+VOID LogSentData(const char    * const cFuncName,
+                 const wchar_t * const wHeaders,
+                 const uint32_t HeadersLength,
+                 const unsigned char * const cContent,
+                 const uint32_t ContentLen)
 {
-    if (headers == NULL) return;
-    fprintf(m_StringsFile, "[%s] : [%d]%ls : [%d]\n", funcname,  headers_length, headers, content_len);
-    for (int i = 0; i < content_len; i++) {
-	if (isalnum(content[i])) {
-	    fprintf(m_StringsFile, "%c ", content[i]);
+    if (wHeaders == NULL)
+        return;
+    fprintf(g_StringsFile, "[%s] : [%d]%ls : [%d]\n", cFuncName, HeadersLength, wHeaders, ContentLen);
+    for (uint32_t i = 0; i < ContentLen; i++) {
+	if (isalnum(cContent[i])) {
+	    fprintf(g_StringsFile, "%c ", cContent[i]);
 	} else {
-	    fprintf(m_StringsFile, ". ", content[i]);
+	    fprintf(g_StringsFile, ". ", cContent[i]);
 	}
     }
-    if (content_len) {
-	fprintf(m_StringsFile, "\nhex: \n");
+    if (ContentLen) {
+	fprintf(g_StringsFile, "\nhex: \n");
     }
-    for (int i = 0; i < content_len; i++) {
-	fprintf(m_StringsFile, "%#" HEX_PADD "x ", content[i]);
+    for (uint32_t i = 0; i < ContentLen; i++) {
+	fprintf(g_StringsFile, "%#" HEX_PADD "x ", cContent[i]);
     }
-    if (content_len) {
-	fprintf(m_StringsFile, "---\n");
+    if (ContentLen) {
+	fprintf(g_StringsFile, "---\n");
     }
-    fflush(m_StringsFile);
+    fflush(g_StringsFile);
 }
 
-VOID MonitorFunction1Arg(IMG Image, const char *funcName)
+VOID MonitorFunction1Arg(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorCreateProcess(IMG Image, const char* funcName)
+VOID MonitorCreateProcess(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction2WChar,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction2WChar,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorWideCharToMultiByte(IMG Image, const char *funcName)
+VOID MonitorWideCharToMultiByte(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorVsnsprintf(IMG Image, const char *funcName)
+VOID MonitorVsnsprintf(IMG Image, const char * const funcName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, funcName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_AFTER, (AFUNPTR)LogFunction1Char,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_AFTER, (AFUNPTR)LogFunction1Char,
 			   IARG_ADDRINT, funcName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
 			   IARG_END
 			   );
-	    RTN_Close(cfwRtn);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorCreateFileW(IMG Image, const char *funcName)
+VOID MonitorCreateFileW(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorRegOpenKeyExW(IMG Image, const char *funcName)
+VOID MonitorRegOpenKeyExW(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunction1WChar,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID MonitorHttpSendRequestW(IMG Image, const char *funcName)
+VOID MonitorHttpSendRequestW(IMG Image, const char * const cFuncName)
 {
-    RTN cfwRtn = RTN_FindByName(Image, funcName);
-    if (RTN_Valid(cfwRtn))
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn))
 	{
-	    RTN_Open(cfwRtn);
-	    RTN_InsertCall(cfwRtn, IPOINT_BEFORE, (AFUNPTR)LogSentData,
-			   IARG_ADDRINT, funcName,
+	    RTN_Open(CfwRtn);
+	    RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogSentData,
+			   IARG_ADDRINT, cFuncName,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 1,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 2,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 3,
 			   IARG_FUNCARG_ENTRYPOINT_VALUE, 4,
-			   IARG_END
-			   );
-	    RTN_Close(cfwRtn);
+			   IARG_END);
+	    RTN_Close(CfwRtn);
 	}
 }
 
-VOID ImageLoad(IMG Image, VOID *v)
+VOID LogFunctionArgs(const char * const cFuncName, THREADID Tid, ADDRINT Sp)
+{
+    assert(cFuncName != NULL);
+
+    pApiArgsFormat ArgFmt = FindFormatByName(g_ArgsArrayPtr, cFuncName);
+    if (ArgFmt != NULL) {
+        if (g_Args == NULL) {
+            g_Args = (char *)calloc(AT_PAGE_SIZE, sizeof(char));
+            if (g_Args == NULL)
+                goto noargs;
+        }
+        assert(g_Args != NULL);
+
+        FormatArguments(g_Args, ArgFmt->cApiArgsFormat, (void *)(Sp + sizeof(ADDRINT)));
+        fprintf(g_StringsFile, "tid: %-2d function: %s(%s)\n", Tid, cFuncName, g_Args);
+        fflush(g_StringsFile);
+    } else {
+        goto noargs;
+    }
+
+    if (0) {
+    noargs:
+        fprintf(g_StringsFile, "tid: %-2d function: %s(%s)\n", Tid, cFuncName, "no args");
+        fflush(g_StringsFile);
+    }
+}
+
+VOID MonitorFunction(IMG Image, const char * const cFuncName)
+{
+    RTN CfwRtn = RTN_FindByName(Image, cFuncName);
+    if (RTN_Valid(CfwRtn)) {
+        RTN_Open(CfwRtn);
+
+        RTN_InsertCall(CfwRtn, IPOINT_BEFORE, (AFUNPTR)LogFunctionArgs,
+                       IARG_ADDRINT, cFuncName,
+                       IARG_THREAD_ID,
+                       IARG_REG_VALUE, REG_STACK_PTR,
+                       IARG_END);
+
+        RTN_Close(CfwRtn);
+    }
+}
+
+VOID ImageLoad(IMG Image, VOID *V)
 {
     // Add module into a global map
-    s_module mod;
-    mod.name  = std::string(IMG_Name(Image));
-    mod.start = IMG_LowAddress(Image);
-    mod.end   = IMG_HighAddress(Image);
-    m_Modules[mod.start] = mod;
+    s_Module Mod;
+    Mod.Name  = std::string(IMG_Name(Image));
+    Mod.Start = IMG_LowAddress(Image);
+    Mod.End   = IMG_HighAddress(Image);
+    g_Modules[Mod.Start] = Mod;
 
-    if (m_myPid == 0 && isMyModule(&mod, m_AnalysedApp)) {
-
+    if (g_MyPid == 0 && IsMyModule(&Mod, g_AnalysedApp)) {
 	// enumerate sections within the analysed module
 	for (SEC sec = IMG_SecHead(Image); SEC_Valid(sec); sec = SEC_Next(sec)) {
-	    s_module section;
-	    section.name  = SEC_Name(sec);
-	    section.start = SEC_Address(sec) - mod.start;
-	    section.end   = section.start + SEC_Size(sec);
-	    m_Sections[section.start] = section;
+	    s_Module Section;
+	    Section.Name  = SEC_Name(sec);
+	    Section.Start = SEC_Address(sec) - Mod.Start;
+	    Section.End   = Section.Start + SEC_Size(sec);
+	    g_Sections[Section.Start] = Section;
 	}
     }
-    // functions chosen to be monitored:
-    MonitorFunction1Arg(Image, "LoadLibraryW");
-    MonitorCreateProcess(Image, "CreateProcessW");
-    MonitorWideCharToMultiByte(Image, "WideCharToMultiByte");
-    MonitorVsnsprintf(Image, "_vsnprintf");
-    MonitorRegOpenKeyExW(Image, "RegOpenKeyExW");
-    MonitorHttpSendRequestW(Image, "HttpSendRequestW");
-    MonitorCreateFileW(Image, "CreateFileW");
+
+    string ArgsFileName = KnobInputArgsFile.Value();
+    if (ArgsFileName.empty()) {
+    monitor_chosen:
+        // functions chosen to be monitored:
+        MonitorFunction1Arg(Image, "LoadLibraryW");
+        MonitorCreateProcess(Image, "CreateProcessW");
+        MonitorWideCharToMultiByte(Image, "WideCharToMultiByte");
+        MonitorVsnsprintf(Image, "_vsnprintf");
+        MonitorRegOpenKeyExW(Image, "RegOpenKeyExW");
+        MonitorHttpSendRequestW(Image, "HttpSendRequestW");
+        MonitorCreateFileW(Image, "CreateFileW");
+    } else {
+        if (g_ArgsArrayPtr == NULL) {
+            g_ArgsArrayPtr = LoadApiArgsFormat(ArgsFileName.c_str());
+            if (g_ArgsArrayPtr == NULL)
+                goto monitor_chosen;
+        }
+        assert(g_ArgsArrayPtr != NULL);
+
+        for (size_t i = 0; i < g_ArgsArrayPtr->Count; i++) {
+            MonitorFunction(Image, g_ArgsArrayPtr->Args[i].cApiName);
+        }
+    }
+}
+
+BOOL Init()
+{
+    // init output file:
+    string FileName = KnobOutputFile.Value();
+    if (FileName.empty())
+        FileName = "output.txt";
+    g_TraceFile = fopen(FileName.c_str(), "w");
+    if (g_TraceFile == NULL) {
+        cerr << "Failed to open trace file" << endl;
+
+        return false;
+    }
+
+    g_StringsFileName = FileName + "_strings.txt";
+    g_StringsFile = fopen(g_StringsFileName.c_str(), "w");
+    if (g_StringsFile == NULL) {
+        cerr << "Failed to open strings file" << endl;
+
+        return false;
+    }
+
+    return true;
+}
+
+VOID Fini(INT32 ExitCode, VOID *V)
+{
+    UnloadApiArgsFormat(g_ArgsArrayPtr);
+
+    if (g_Args != NULL) {
+        free(g_Args);
+        g_Args = NULL;
+    }
+
+    fclose(g_TraceFile);
+    fclose(g_StringsFile);
+}
+
+/* ===================================================================== */
+// Utilities
+/* ===================================================================== */
+
+/*!
+ *  Print out help message.
+ */
+INT32 Usage()
+{
+    cerr << "This tool prints out : " << endl <<
+	"Addresses of redirections into to a new section." << endl << endl;
+
+    cerr << KNOB_BASE::StringKnobSummary() << endl;
+
+    return -1;
 }
 
 int main(int argc, char *argv[])
@@ -422,41 +460,40 @@ int main(int argc, char *argv[])
 	    return Usage();
 	}
 
-    m_AnalysedApp = KnobModuleName.Value();
-    if (m_AnalysedApp.length() == 0) {
-	// init App Name (m_AnalysedApp):
+    g_AnalysedApp = KnobModuleName.Value();
+    if (g_AnalysedApp.length() == 0) {
+	// init App Name (g_AnalysedApp):
 	for (int i = 1; i < (argc - 1); i++ ) {
 	    if (strcmp(argv[i], "--") == 0) {
-		m_AnalysedApp = argv[i + 1];
+		g_AnalysedApp = argv[i + 1];
 		if (i + 2 < argc) {
-		    m_Param = argv[i + 2];
+		    g_Param = argv[i + 2];
 		}
 		break;
 	    }
 	}
     }
-    // init output file:
-    string fileName = KnobOutputFile.Value();
-    if (fileName.empty()) fileName = "output.txt";
-    m_TraceFile = fopen(fileName.c_str(), "w");
 
-    m_StringsFileName = fileName + "_strings.txt";
-    m_StringsFile = fopen(m_StringsFileName.c_str(), "w");
+    if (!Init())
+        return -1;
 
     // Register function to be called for every loaded module
     IMG_AddInstrumentFunction(ImageLoad, 0);
 
     // Register function to be called to instrument traces
-    TRACE_AddInstrumentFunction(Trace, 0);
-	
+    TRACE_AddInstrumentFunction(InstrumentTrace, 0);
+
     cout << "===============================================" << endl;
     cout << "This application is instrumented by " << TOOL_NAME << endl;
-    cout << "Tracing module: " << m_AnalysedApp << endl;
+    cout << "Tracing module: " << g_AnalysedApp << endl;
     if (!KnobOutputFile.Value().empty()) 
 	{
 	    cout << "See file " << KnobOutputFile.Value() << " for analysis results" << endl;
 	}
     cout << "===============================================" << endl;
+
+    // Register function to be called when the application exits
+    PIN_AddFiniFunction(Fini, 0);
 
     // Start the program, never returns
     PIN_StartProgram();
